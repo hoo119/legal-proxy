@@ -45,11 +45,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self._cors()
-        self.end_headers()
+        try:
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+        except Exception:
+            pass
 
     def do_GET(self):
+        # 어떤 예외가 나더라도 서버 프로세스 자체는 절대 죽지 않도록 전체를 감쌉니다.
+        # (이전 버전은 클라이언트가 응답을 기다리다 먼저 끊으면 write 과정에서 예외가 나서
+        #  서버 전체가 죽는 문제가 있었고, 그 뒤 모든 요청이 CORS 헤더 없는 오류로 실패했습니다.)
+        try:
+            self._handle_get()
+        except Exception as e:
+            try:
+                self.send_response(500)
+                self._cors()
+                self.end_headers()
+                self.wfile.write(('내부 오류: ' + str(e)).encode('utf-8'))
+            except Exception:
+                pass  # 클라이언트가 이미 연결을 끊은 경우 등 - 조용히 무시하고 다음 요청을 받는다
+
+    def _handle_get(self):
         parsed = urllib.parse.urlparse(self.path)
 
         if parsed.path == '/':
@@ -89,7 +107,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 target,
                 headers={'User-Agent': 'Mozilla/5.0 (legal-ai-assistant cloud proxy)'}
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 data = resp.read()
 
             self.send_response(200)
@@ -107,7 +125,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
 
+class ThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    # 요청마다 별도 스레드로 처리 -> 한 요청이 문제를 일으켜도 다른 요청/서버 전체에 영향 없음
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 if __name__ == '__main__':
-    with socketserver.TCPServer(("0.0.0.0", PORT), ProxyHandler) as httpd:
+    with ThreadingServer(("0.0.0.0", PORT), ProxyHandler) as httpd:
         print("서버 실행 중: 포트 %d" % PORT)
         httpd.serve_forever()
