@@ -1,7 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용)
---------------------------------------------------------------
+법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용, Turso 코퍼스 연동판)
+--------------------------------------------------------------------------------
+Render.com에 올려서 공개 URL을 부여받아 어느 PC/사람이든 접속할 수 있게 하는 프록시입니다.
+코퍼스(조문·판례 저장소)는 Render의 로컬 디스크 대신 Turso(외부 SQLite 호환 클라우드, 무료 5GB)에
+저장합니다 — Render 재배포 시 초기화되지 않고, 대용량(수만 건)도 안정적으로 담을 수 있습니다.
+
+배포 방법 (Render.com, 무료):
+1) https://github.com 에 새 저장소를 만들고 이 파일 하나만 업로드 (파일명 그대로 유지)
+2) https://render.com 에서 GitHub 저장소 선택해 Web Service 생성
+3) 설정값:
+     - Runtime: Python 3
+     - Build Command: pip install libsql-client
+     - Start Command: python proxy_server_cloud.py
+     - Instance Type: Free
+4) Render 대시보드 > Environment 탭에서 아래 환경변수 등록:
+     - TURSO_DATABASE_URL  (Turso에서 발급받은 libsql://... 주소)
+     - TURSO_AUTH_TOKEN    (Turso에서 발급받은 토큰)
+     - GOOGLE_API_KEY, GOOGLE_CX (선택, 웹검색 발견 기능용)
+5) legal-ai-assistant.html의 PROXY_BASE를 이 서비스의 공개 주소로 맞춰둡니다.
+
+주의: 무료 요금제는 15분간 요청이 없으면 서버가 잠들고, 다음 요청 시 깨어나는 데
+      약 20~50초가 걸릴 수 있습니다.
 """
 
 import http.server
@@ -10,81 +30,95 @@ import urllib.request
 import urllib.parse
 import os
 import sys
-import sqlite3
 import json
 
-PORT = int(os.environ.get('PORT', 8000))  # Render가 자동으로 PORT 환경변수를 지정해줌
+try:
+    import libsql_client
+except ImportError:
+    libsql_client = None  # Build Command에 pip install libsql-client가 빠지면 여기서 걸림
+
+PORT = int(os.environ.get('PORT', 8000))
 ALLOWED_HOSTS = ("www.law.go.kr", "law.go.kr")  # 법제처 API 외의 임의 URL 프록시 방지
 
-# Google Custom Search API 인증정보. Render 대시보드의 Environment 탭에서 환경변수로 설정하세요
-# (코드에 직접 적지 않는 이유: 이 파일은 GitHub에 공개로 올라가므로, 키를 그대로 적으면 누구나 볼 수 있습니다)
 GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY', '')
-GOOGLE_CX = os.environ.get('GOOGLE_CX', '')  # Programmable Search Engine ID
+GOOGLE_CX = os.environ.get('GOOGLE_CX', '')
 
-# ============================================================================
-# 로컬 코퍼스(SQLite + FTS5) — 법제처 API로 검증에 성공한 조문·판례를 여기에 영구 저장해서,
-# 사용할수록 우리만의 코퍼스가 쌓이도록 한다. FTS5의 bm25() 랭킹을 써서 crow-tit(Elasticsearch)와
-# 같은 계열의 검색 알고리즘을 적용한다.
-# 주의: Render 무료 웹서비스의 디스크는 "재배포(새 코드 push)" 시 초기화된다. 서버가 잠들었다
-# 깨어나는 것만으로는 지워지지 않지만, 완전히 끊기지 않는 영구 저장을 원하면 Render의 유료
-# Persistent Disk나 Turso 같은 외부 SQLite 호스팅으로 옮겨야 한다.
-# ============================================================================
-DB_PATH = os.environ.get('CORPUS_DB_PATH', 'corpus.db')
+TURSO_URL = os.environ.get('TURSO_DATABASE_URL', '').strip()
+TURSO_TOKEN = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('PRAGMA journal_mode=WAL')   # 쓰기 성능 개선: 매 저장마다 디스크 전체 동기화하지 않도록
-    conn.execute('PRAGMA synchronous=NORMAL')  # WAL 모드와 함께 쓰면 안전하면서도 훨씬 빠름
-    conn.execute('''CREATE TABLE IF NOT EXISTS articles (
-        id INTEGER PRIMARY KEY,
-        law_name TEXT NOT NULL,
-        article_no TEXT NOT NULL,
-        content TEXT NOT NULL,
-        UNIQUE(law_name, article_no)
-    )''')
-    conn.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
-        law_name, article_no UNINDEXED, content, content='articles', content_rowid='id'
-    )''')
-    conn.execute('''CREATE TRIGGER IF NOT EXISTS articles_ai AFTER INSERT ON articles BEGIN
-        INSERT INTO articles_fts(rowid, law_name, article_no, content)
-        VALUES (new.id, new.law_name, new.article_no, new.content);
-    END''')
-    conn.execute('''CREATE TRIGGER IF NOT EXISTS articles_au AFTER UPDATE ON articles BEGIN
-        INSERT INTO articles_fts(articles_fts, rowid, law_name, article_no, content)
-        VALUES('delete', old.id, old.law_name, old.article_no, old.content);
-        INSERT INTO articles_fts(rowid, law_name, article_no, content)
-        VALUES (new.id, new.law_name, new.article_no, new.content);
-    END''')
+def get_turso_client():
+    if not libsql_client:
+        raise RuntimeError("libsql_client 미설치. Render Build Command를 'pip install libsql-client'로 설정하세요.")
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise RuntimeError("TURSO_DATABASE_URL / TURSO_AUTH_TOKEN 환경변수가 설정되지 않았습니다.")
+    # libsql_client의 동기(sync) HTTP 클라이언트는 https:// 스킴을 기대하므로 libsql:// 를 변환
+    url = TURSO_URL.replace('libsql://', 'https://', 1)
+    return libsql_client.create_client_sync(url=url, auth_token=TURSO_TOKEN)
 
-    conn.execute('''CREATE TABLE IF NOT EXISTS precedents (
-        id INTEGER PRIMARY KEY,
-        case_id TEXT UNIQUE NOT NULL,
-        case_no TEXT,
-        case_name TEXT,
-        court TEXT,
-        date TEXT,
-        summary TEXT
-    )''')
-    conn.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS precedents_fts USING fts5(
-        case_no UNINDEXED, case_name, summary, content='precedents', content_rowid='id'
-    )''')
-    conn.execute('''CREATE TRIGGER IF NOT EXISTS precedents_ai AFTER INSERT ON precedents BEGIN
-        INSERT INTO precedents_fts(rowid, case_no, case_name, summary)
-        VALUES (new.id, new.case_no, new.case_name, new.summary);
-    END''')
-    conn.execute('''CREATE TRIGGER IF NOT EXISTS precedents_au AFTER UPDATE ON precedents BEGIN
-        INSERT INTO precedents_fts(precedents_fts, rowid, case_no, case_name, summary)
-        VALUES('delete', old.id, old.case_no, old.case_name, old.summary);
-        INSERT INTO precedents_fts(rowid, case_no, case_name, summary)
-        VALUES (new.id, new.case_no, new.case_name, new.summary);
-    END''')
-    conn.commit()
-    return conn
+
+_schema_ready = False
+
+
+def ensure_schema():
+    # 서버가 켜져 있는 동안 한 번만 스키마를 만든다 (매 요청마다 재실행하지 않음)
+    global _schema_ready
+    if _schema_ready:
+        return
+    client = get_turso_client()
+    try:
+        statements = [
+            '''CREATE TABLE IF NOT EXISTS articles (
+                id INTEGER PRIMARY KEY,
+                law_name TEXT NOT NULL,
+                article_no TEXT NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(law_name, article_no)
+            )''',
+            '''CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
+                law_name, article_no UNINDEXED, content, content='articles', content_rowid='id'
+            )''',
+            '''CREATE TRIGGER IF NOT EXISTS articles_ai AFTER INSERT ON articles BEGIN
+                INSERT INTO articles_fts(rowid, law_name, article_no, content)
+                VALUES (new.id, new.law_name, new.article_no, new.content);
+            END''',
+            '''CREATE TRIGGER IF NOT EXISTS articles_au AFTER UPDATE ON articles BEGIN
+                INSERT INTO articles_fts(articles_fts, rowid, law_name, article_no, content)
+                VALUES('delete', old.id, old.law_name, old.article_no, old.content);
+                INSERT INTO articles_fts(rowid, law_name, article_no, content)
+                VALUES (new.id, new.law_name, new.article_no, new.content);
+            END''',
+            '''CREATE TABLE IF NOT EXISTS precedents (
+                id INTEGER PRIMARY KEY,
+                case_id TEXT UNIQUE NOT NULL,
+                case_no TEXT,
+                case_name TEXT,
+                court TEXT,
+                date TEXT,
+                summary TEXT
+            )''',
+            '''CREATE VIRTUAL TABLE IF NOT EXISTS precedents_fts USING fts5(
+                case_no UNINDEXED, case_name, summary, content='precedents', content_rowid='id'
+            )''',
+            '''CREATE TRIGGER IF NOT EXISTS precedents_ai AFTER INSERT ON precedents BEGIN
+                INSERT INTO precedents_fts(rowid, case_no, case_name, summary)
+                VALUES (new.id, new.case_no, new.case_name, new.summary);
+            END''',
+            '''CREATE TRIGGER IF NOT EXISTS precedents_au AFTER UPDATE ON precedents BEGIN
+                INSERT INTO precedents_fts(precedents_fts, rowid, case_no, case_name, summary)
+                VALUES('delete', old.id, old.case_no, old.case_name, old.summary);
+                INSERT INTO precedents_fts(rowid, case_no, case_name, summary)
+                VALUES (new.id, new.case_no, new.case_name, new.summary);
+            END''',
+        ]
+        for stmt in statements:
+            client.execute(stmt)
+        _schema_ready = True
+    finally:
+        client.close()
 
 
 def fts_match_expr(query_text):
-    # 사용자가 입력한 여러 단어를 FTS5 MATCH 문법에 맞게 "단어1" OR "단어2" 형태로 안전하게 변환
     terms = [t.strip() for t in query_text.split() if t.strip()]
     if not terms:
         return None
@@ -95,7 +129,9 @@ def fts_match_expr(query_text):
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Max-Age', '86400')
 
     def do_OPTIONS(self):
         try:
@@ -106,9 +142,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        # 어떤 예외가 나더라도 서버 프로세스 자체는 절대 죽지 않도록 전체를 감쌉니다.
-        # (이전 버전은 클라이언트가 응답을 기다리다 먼저 끊으면 write 과정에서 예외가 나서
-        #  서버 전체가 죽는 문제가 있었고, 그 뒤 모든 요청이 CORS 헤더 없는 오류로 실패했습니다.)
         try:
             self._handle_get()
         except Exception as e:
@@ -118,7 +151,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(('내부 오류: ' + str(e)).encode('utf-8'))
             except Exception:
-                pass  # 클라이언트가 이미 연결을 끊은 경우 등 - 조용히 무시하고 다음 요청을 받는다
+                pass
 
     def _handle_get(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -180,7 +213,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 target,
                 headers={'User-Agent': 'Mozilla/5.0 (legal-ai-assistant cloud proxy)'}
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = resp.read()
 
             self.send_response(200)
@@ -193,58 +226,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
             self.wfile.write(('법제처 API 호출 실패: ' + str(e)).encode('utf-8'))
-
-    def _handle_web_search(self, parsed):
-        # Google Custom Search API 프록시. API 키는 서버(이 프로세스)에만 있고 브라우저에는
-        # 절대 노출되지 않는다. 이 결과는 "발견"용일 뿐이며, 최종 답변에 실제로 인용되는 조문·판례는
-        # 반드시 /proxy를 통해 law.go.kr에서 별도로 검증한 원문만 사용해야 한다.
-        if not GOOGLE_API_KEY or not GOOGLE_CX:
-            self.send_response(500)
-            self._cors()
-            self.end_headers()
-            self.wfile.write('Google 검색 API 키가 서버에 설정되어 있지 않습니다. Render 대시보드 > Environment에서 GOOGLE_API_KEY, GOOGLE_CX를 설정하세요.'.encode('utf-8'))
-            return
-
-        qs = urllib.parse.parse_qs(parsed.query)
-        query = qs.get('query', [None])[0]
-        num = qs.get('num', ['5'])[0]
-
-        if not query:
-            self.send_response(400)
-            self._cors()
-            self.end_headers()
-            self.wfile.write('query 파라미터가 없습니다.'.encode('utf-8'))
-            return
-
-        try:
-            num_int = max(1, min(int(num), 10))  # Google Custom Search는 1회 요청당 최대 10건
-        except ValueError:
-            num_int = 5
-
-        search_url = ('https://www.googleapis.com/customsearch/v1'
-                      + '?key=' + urllib.parse.quote(GOOGLE_API_KEY)
-                      + '&cx=' + urllib.parse.quote(GOOGLE_CX)
-                      + '&q=' + urllib.parse.quote(query)
-                      + '&num=' + str(num_int))
-
-        try:
-            req = urllib.request.Request(
-                search_url,
-                headers={'User-Agent': 'Mozilla/5.0 (legal-ai-assistant cloud proxy)'}
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = resp.read()
-
-            self.send_response(200)
-            self._cors()
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception as e:
-            self.send_response(502)
-            self._cors()
-            self.end_headers()
-            self.wfile.write(('Google 검색 API 호출 실패: ' + str(e)).encode('utf-8'))
 
     def do_POST(self):
         try:
@@ -285,6 +266,50 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    # ---------------- 웹 검색 (발견용) ----------------
+    def _handle_web_search(self, parsed):
+        if not GOOGLE_API_KEY or not GOOGLE_CX:
+            self.send_response(500)
+            self._cors()
+            self.end_headers()
+            self.wfile.write('Google 검색 API 키가 서버에 설정되어 있지 않습니다.'.encode('utf-8'))
+            return
+
+        qs = urllib.parse.parse_qs(parsed.query)
+        query = qs.get('query', [None])[0]
+        num = qs.get('num', ['5'])[0]
+        if not query:
+            self.send_response(400)
+            self._cors()
+            self.end_headers()
+            self.wfile.write('query 파라미터가 없습니다.'.encode('utf-8'))
+            return
+        try:
+            num_int = max(1, min(int(num), 10))
+        except ValueError:
+            num_int = 5
+
+        search_url = ('https://www.googleapis.com/customsearch/v1'
+                      + '?key=' + urllib.parse.quote(GOOGLE_API_KEY)
+                      + '&cx=' + urllib.parse.quote(GOOGLE_CX)
+                      + '&q=' + urllib.parse.quote(query)
+                      + '&num=' + str(num_int))
+        try:
+            req = urllib.request.Request(search_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = resp.read()
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self.send_response(502)
+            self._cors()
+            self.end_headers()
+            self.wfile.write(('Google 검색 API 호출 실패: ' + str(e)).encode('utf-8'))
+
+    # ---------------- 코퍼스 (Turso) ----------------
     def _handle_corpus_search_articles(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
         query = qs.get('query', [None])[0]
@@ -296,28 +321,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             limit_num = 5
 
         match = fts_match_expr(query or '')
-        if not match:
-            self.send_response(200)
-            self._cors()
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(json.dumps({'items': []}).encode('utf-8'))
-            return
-
-        conn = get_db()
-        try:
-            sql = ('SELECT law_name, article_no, content FROM articles_fts '
-                   'WHERE articles_fts MATCH ?')
-            params = [match]
-            if law:
-                sql += ' AND law_name = ?'
-                params.append(law)
-            sql += ' ORDER BY bm25(articles_fts) LIMIT ?'
-            params.append(limit_num)
-            rows = conn.execute(sql, params).fetchall()
-            items = [{'law_name': r[0], 'article_no': r[1], 'content': r[2]} for r in rows]
-        finally:
-            conn.close()
+        items = []
+        if match:
+            ensure_schema()
+            client = get_turso_client()
+            try:
+                sql = 'SELECT law_name, article_no, content FROM articles_fts WHERE articles_fts MATCH ?'
+                params = [match]
+                if law:
+                    sql += ' AND law_name = ?'
+                    params.append(law)
+                sql += ' ORDER BY bm25(articles_fts) LIMIT ?'
+                params.append(limit_num)
+                rs = client.execute(sql, params)
+                items = [{'law_name': r[0], 'article_no': r[1], 'content': r[2]} for r in rs.rows]
+            finally:
+                client.close()
 
         self.send_response(200)
         self._cors()
@@ -335,26 +354,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             limit_num = 8
 
         match = fts_match_expr(query or '')
-        if not match:
-            self.send_response(200)
-            self._cors()
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(json.dumps({'items': []}).encode('utf-8'))
-            return
-
-        conn = get_db()
-        try:
-            rows = conn.execute(
-                'SELECT p.case_id, p.case_no, p.case_name, p.court, p.date, p.summary '
-                'FROM precedents_fts JOIN precedents p ON p.id = precedents_fts.rowid '
-                'WHERE precedents_fts MATCH ? ORDER BY bm25(precedents_fts) LIMIT ?',
-                [match, limit_num]
-            ).fetchall()
-            items = [{'case_id': r[0], 'case_no': r[1], 'case_name': r[2],
-                      'court': r[3], 'date': r[4], 'summary': r[5]} for r in rows]
-        finally:
-            conn.close()
+        items = []
+        if match:
+            ensure_schema()
+            client = get_turso_client()
+            try:
+                rs = client.execute(
+                    'SELECT p.case_id, p.case_no, p.case_name, p.court, p.date, p.summary '
+                    'FROM precedents_fts JOIN precedents p ON p.id = precedents_fts.rowid '
+                    'WHERE precedents_fts MATCH ? ORDER BY bm25(precedents_fts) LIMIT ?',
+                    [match, limit_num]
+                )
+                items = [{'case_id': r[0], 'case_no': r[1], 'case_name': r[2],
+                          'court': r[3], 'date': r[4], 'summary': r[5]} for r in rs.rows]
+            finally:
+                client.close()
 
         self.send_response(200)
         self._cors()
@@ -363,9 +377,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
 
     def _handle_corpus_pending_precedents(self, parsed):
-        # 목록만 저장되고(요지가 비어있음) 아직 상세조회가 안 된 판례들을 배치로 돌려준다.
-        # 브라우저 수집기가 이걸 호출해서 "다음에 뭘 상세조회해야 하는지" 서버 DB에서 바로 받아간다
-        # (localStorage 용량 제한 없이, 진행상태를 서버 코퍼스 자체에 두는 방식)
         qs = urllib.parse.parse_qs(parsed.query)
         limit = qs.get('limit', ['20'])[0]
         try:
@@ -373,15 +384,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             limit_num = 20
 
-        conn = get_db()
+        ensure_schema()
+        client = get_turso_client()
         try:
-            rows = conn.execute(
+            rs = client.execute(
                 "SELECT case_id, case_no FROM precedents WHERE summary IS NULL OR summary = '' LIMIT ?",
                 [limit_num]
-            ).fetchall()
-            items = [{'case_id': r[0], 'case_no': r[1]} for r in rows]
+            )
+            items = [{'case_id': r[0], 'case_no': r[1]} for r in rs.rows]
         finally:
-            conn.close()
+            client.close()
 
         self.send_response(200)
         self._cors()
@@ -390,12 +402,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
 
     def _handle_corpus_count_precedents(self, parsed):
-        conn = get_db()
+        ensure_schema()
+        client = get_turso_client()
         try:
-            total = conn.execute("SELECT COUNT(*) FROM precedents").fetchone()[0]
-            pending = conn.execute("SELECT COUNT(*) FROM precedents WHERE summary IS NULL OR summary = ''").fetchone()[0]
+            total = client.execute("SELECT COUNT(*) FROM precedents").rows[0][0]
+            pending = client.execute(
+                "SELECT COUNT(*) FROM precedents WHERE summary IS NULL OR summary = ''"
+            ).rows[0][0]
         finally:
-            conn.close()
+            client.close()
+
         self.send_response(200)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -413,16 +429,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write('law, no, content이 모두 필요합니다.'.encode('utf-8'))
             return
 
-        conn = get_db()
+        ensure_schema()
+        client = get_turso_client()
         try:
-            conn.execute(
+            client.execute(
                 'INSERT INTO articles (law_name, article_no, content) VALUES (?, ?, ?) '
                 'ON CONFLICT(law_name, article_no) DO UPDATE SET content=excluded.content',
                 [law, no, content]
             )
-            conn.commit()
         finally:
-            conn.close()
+            client.close()
 
         self.send_response(200)
         self._cors()
@@ -438,9 +454,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write('case_id가 필요합니다.'.encode('utf-8'))
             return
 
-        conn = get_db()
+        ensure_schema()
+        client = get_turso_client()
         try:
-            conn.execute(
+            client.execute(
                 'INSERT INTO precedents (case_id, case_no, case_name, court, date, summary) '
                 'VALUES (?, ?, ?, ?, ?, ?) '
                 'ON CONFLICT(case_id) DO UPDATE SET '
@@ -449,9 +466,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 [case_id, body.get('case_no', ''), body.get('case_name', ''),
                  body.get('court', ''), body.get('date', ''), body.get('summary', '')]
             )
-            conn.commit()
         finally:
-            conn.close()
+            client.close()
 
         self.send_response(200)
         self._cors()
@@ -459,7 +475,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b'ok')
 
     def _handle_corpus_save_precedents_batch(self, body):
-        # 여러 건을 한 트랜잭션으로 저장 — 건마다 디스크 동기화하던 방식보다 훨씬 빠르고 타임아웃도 적음
         items = body.get('items') or []
         if not isinstance(items, list) or not items:
             self.send_response(400)
@@ -468,14 +483,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write('items 배열이 필요합니다.'.encode('utf-8'))
             return
 
-        conn = get_db()
+        ensure_schema()
+        client = get_turso_client()
         saved = 0
         try:
+            statements = []
             for it in items:
                 case_id = (it.get('case_id') or '').strip()
                 if not case_id:
                     continue
-                conn.execute(
+                statements.append((
                     'INSERT INTO precedents (case_id, case_no, case_name, court, date, summary) '
                     'VALUES (?, ?, ?, ?, ?, ?) '
                     'ON CONFLICT(case_id) DO UPDATE SET '
@@ -483,11 +500,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     'court=excluded.court, date=excluded.date, summary=excluded.summary',
                     [case_id, it.get('case_no', ''), it.get('case_name', ''),
                      it.get('court', ''), it.get('date', ''), it.get('summary', '')]
-                )
-                saved += 1
-            conn.commit()
+                ))
+            if statements:
+                # 여러 건을 한 번의 왕복(배치)으로 처리 — 건별 요청보다 훨씬 빠르고 타임아웃도 적음
+                client.batch(statements)
+                saved = len(statements)
         finally:
-            conn.close()
+            client.close()
 
         self.send_response(200)
         self._cors()
@@ -500,7 +519,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    # 요청마다 별도 스레드로 처리 -> 한 요청이 문제를 일으켜도 다른 요청/서버 전체에 영향 없음
     daemon_threads = True
     allow_reuse_address = True
 
