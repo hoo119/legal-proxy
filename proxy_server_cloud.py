@@ -1,29 +1,11 @@
+
 # -*- coding: utf-8 -*-
 """
 법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용, Turso 코퍼스 연동판)
 --------------------------------------------------------------------------------
-Render.com에 올려서 공개 URL을 부여받아 어느 PC/사람이든 접속할 수 있게 하는 프록시입니다.
-코퍼스(조문·판례 저장소)는 Render의 로컬 디스크 대신 Turso(외부 SQLite 호환 클라우드, 무료 5GB)에
-저장합니다 — Render 재배포 시 초기화되지 않고, 대용량(수만 건)도 안정적으로 담을 수 있습니다.
 
-배포 방법 (Render.com, 무료):
-1) https://github.com 에 새 저장소를 만들고 이 파일 하나만 업로드 (파일명 그대로 유지)
-2) https://render.com 에서 GitHub 저장소 선택해 Web Service 생성
-3) 설정값:
-     - Runtime: Python 3
-     - Build Command: pip install libsql-client
-     - Start Command: python proxy_server_cloud.py
-     - Instance Type: Free
-4) Render 대시보드 > Environment 탭에서 아래 환경변수 등록:
-     - TURSO_DATABASE_URL  (Turso에서 발급받은 libsql://... 주소)
-     - TURSO_AUTH_TOKEN    (Turso에서 발급받은 토큰)
-     - GOOGLE_API_KEY, GOOGLE_CX (선택, 웹검색 발견 기능용)
-5) legal-ai-assistant.html의 PROXY_BASE를 이 서비스의 공개 주소로 맞춰둡니다.
-
-주의: 무료 요금제는 15분간 요청이 없으면 서버가 잠들고, 다음 요청 시 깨어나는 데
-      약 20~50초가 걸릴 수 있습니다.
 """
-
+ 
 import http.server
 import socketserver
 import urllib.request
@@ -31,22 +13,22 @@ import urllib.parse
 import os
 import sys
 import json
-
+ 
 try:
     import libsql_client
 except ImportError:
     libsql_client = None  # Build Command에 pip install libsql-client가 빠지면 여기서 걸림
-
+ 
 PORT = int(os.environ.get('PORT', 8000))
 ALLOWED_HOSTS = ("www.law.go.kr", "law.go.kr")  # 법제처 API 외의 임의 URL 프록시 방지
-
+ 
 GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY', '')
 GOOGLE_CX = os.environ.get('GOOGLE_CX', '')
-
+ 
 TURSO_URL = os.environ.get('TURSO_DATABASE_URL', '').strip()
 TURSO_TOKEN = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
-
-
+ 
+ 
 def get_turso_client():
     if not libsql_client:
         raise RuntimeError("libsql_client 미설치. Render Build Command를 'pip install libsql-client'로 설정하세요.")
@@ -55,11 +37,11 @@ def get_turso_client():
     # libsql_client의 동기(sync) HTTP 클라이언트는 https:// 스킴을 기대하므로 libsql:// 를 변환
     url = TURSO_URL.replace('libsql://', 'https://', 1)
     return libsql_client.create_client_sync(url=url, auth_token=TURSO_TOKEN)
-
-
+ 
+ 
 _schema_ready = False
-
-
+ 
+ 
 def ensure_schema():
     # 서버가 켜져 있는 동안 한 번만 스키마를 만든다 (매 요청마다 재실행하지 않음)
     global _schema_ready
@@ -116,23 +98,23 @@ def ensure_schema():
         _schema_ready = True
     finally:
         client.close()
-
-
+ 
+ 
 def fts_match_expr(query_text):
     terms = [t.strip() for t in query_text.split() if t.strip()]
     if not terms:
         return None
     escaped = ['"' + t.replace('"', '""') + '"' for t in terms]
     return ' OR '.join(escaped)
-
-
+ 
+ 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Access-Control-Max-Age', '86400')
-
+ 
     def do_OPTIONS(self):
         try:
             self.send_response(204)
@@ -140,7 +122,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
         except Exception:
             pass
-
+ 
     def do_GET(self):
         try:
             self._handle_get()
@@ -152,10 +134,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(('내부 오류: ' + str(e)).encode('utf-8'))
             except Exception:
                 pass
-
+ 
     def _handle_get(self):
         parsed = urllib.parse.urlparse(self.path)
-
+ 
         if parsed.path == '/':
             self.send_response(200)
             self._cors()
@@ -163,43 +145,43 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('법률 AI 어시스턴트 프록시 서버가 정상 동작 중입니다.'.encode('utf-8'))
             return
-
+ 
         if parsed.path == '/web_search':
             self._handle_web_search(parsed)
             return
-
+ 
         if parsed.path == '/corpus_search_articles':
             self._handle_corpus_search_articles(parsed)
             return
-
+ 
         if parsed.path == '/corpus_search_precedents':
             self._handle_corpus_search_precedents(parsed)
             return
-
+ 
         if parsed.path == '/corpus_pending_precedents':
             self._handle_corpus_pending_precedents(parsed)
             return
-
+ 
         if parsed.path == '/corpus_count_precedents':
             self._handle_corpus_count_precedents(parsed)
             return
-
+ 
         if parsed.path != '/proxy':
             self.send_response(404)
             self._cors()
             self.end_headers()
             return
-
+ 
         qs = urllib.parse.parse_qs(parsed.query)
         target = qs.get('url', [None])[0]
-
+ 
         if not target:
             self.send_response(400)
             self._cors()
             self.end_headers()
             self.wfile.write('url 파라미터가 없습니다.'.encode('utf-8'))
             return
-
+ 
         target_host = urllib.parse.urlparse(target).hostname or ''
         if target_host not in ALLOWED_HOSTS:
             self.send_response(403)
@@ -207,7 +189,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('허용되지 않은 대상 호스트입니다.'.encode('utf-8'))
             return
-
+ 
         try:
             req = urllib.request.Request(
                 target,
@@ -215,7 +197,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = resp.read()
-
+ 
             self.send_response(200)
             self._cors()
             self.send_header('Content-Type', 'application/xml; charset=utf-8')
@@ -226,7 +208,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
             self.wfile.write(('법제처 API 호출 실패: ' + str(e)).encode('utf-8'))
-
+ 
     def do_POST(self):
         try:
             self._handle_post()
@@ -238,7 +220,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(('내부 오류: ' + str(e)).encode('utf-8'))
             except Exception:
                 pass
-
+ 
     def _handle_post(self):
         parsed = urllib.parse.urlparse(self.path)
         length = int(self.headers.get('Content-Length', 0))
@@ -251,7 +233,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('JSON 파싱 실패'.encode('utf-8'))
             return
-
+ 
         if parsed.path == '/corpus_save_article':
             self._handle_corpus_save_article(body)
             return
@@ -261,11 +243,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if parsed.path == '/corpus_save_precedents_batch':
             self._handle_corpus_save_precedents_batch(body)
             return
-
+ 
         self.send_response(404)
         self._cors()
         self.end_headers()
-
+ 
     # ---------------- 웹 검색 (발견용) ----------------
     def _handle_web_search(self, parsed):
         if not GOOGLE_API_KEY or not GOOGLE_CX:
@@ -274,7 +256,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('Google 검색 API 키가 서버에 설정되어 있지 않습니다.'.encode('utf-8'))
             return
-
+ 
         qs = urllib.parse.parse_qs(parsed.query)
         query = qs.get('query', [None])[0]
         num = qs.get('num', ['5'])[0]
@@ -288,7 +270,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             num_int = max(1, min(int(num), 10))
         except ValueError:
             num_int = 5
-
+ 
         search_url = ('https://www.googleapis.com/customsearch/v1'
                       + '?key=' + urllib.parse.quote(GOOGLE_API_KEY)
                       + '&cx=' + urllib.parse.quote(GOOGLE_CX)
@@ -308,7 +290,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
             self.wfile.write(('Google 검색 API 호출 실패: ' + str(e)).encode('utf-8'))
-
+ 
     # ---------------- 코퍼스 (Turso) ----------------
     def _handle_corpus_search_articles(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
@@ -319,7 +301,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             limit_num = max(1, min(int(limit), 20))
         except ValueError:
             limit_num = 5
-
+ 
         match = fts_match_expr(query or '')
         items = []
         if match:
@@ -337,13 +319,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 items = [{'law_name': r[0], 'article_no': r[1], 'content': r[2]} for r in rs.rows]
             finally:
                 client.close()
-
+ 
         self.send_response(200)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
-
+ 
     def _handle_corpus_search_precedents(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
         query = qs.get('query', [None])[0]
@@ -352,7 +334,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             limit_num = max(1, min(int(limit), 30))
         except ValueError:
             limit_num = 8
-
+ 
         match = fts_match_expr(query or '')
         items = []
         if match:
@@ -369,13 +351,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                           'court': r[3], 'date': r[4], 'summary': r[5]} for r in rs.rows]
             finally:
                 client.close()
-
+ 
         self.send_response(200)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
-
+ 
     def _handle_corpus_pending_precedents(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
         limit = qs.get('limit', ['20'])[0]
@@ -383,7 +365,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             limit_num = max(1, min(int(limit), 100))
         except ValueError:
             limit_num = 20
-
+ 
         ensure_schema()
         client = get_turso_client()
         try:
@@ -394,13 +376,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             items = [{'case_id': r[0], 'case_no': r[1]} for r in rs.rows]
         finally:
             client.close()
-
+ 
         self.send_response(200)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
-
+ 
     def _handle_corpus_count_precedents(self, parsed):
         ensure_schema()
         client = get_turso_client()
@@ -409,15 +391,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             pending = client.execute(
                 "SELECT COUNT(*) FROM precedents WHERE summary IS NULL OR summary = ''"
             ).rows[0][0]
+            supreme_total = client.execute(
+                "SELECT COUNT(*) FROM precedents WHERE court = '대법원'"
+            ).rows[0][0]
+            supreme_pending = client.execute(
+                "SELECT COUNT(*) FROM precedents WHERE court = '대법원' AND (summary IS NULL OR summary = '')"
+            ).rows[0][0]
+            lower_total = total - supreme_total
+            lower_pending = pending - supreme_pending
         finally:
             client.close()
-
+ 
         self.send_response(200)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
-        self.wfile.write(json.dumps({'total': total, 'pending': pending, 'done': total - pending}).encode('utf-8'))
-
+        self.wfile.write(json.dumps({
+            'total': total, 'pending': pending, 'done': total - pending,
+            'supreme': {'total': supreme_total, 'pending': supreme_pending, 'done': supreme_total - supreme_pending},
+            'lower': {'total': lower_total, 'pending': lower_pending, 'done': lower_total - lower_pending}
+        }).encode('utf-8'))
+ 
     def _handle_corpus_save_article(self, body):
         law = (body.get('law') or '').strip()
         no = (body.get('no') or '').strip()
@@ -428,7 +422,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('law, no, content이 모두 필요합니다.'.encode('utf-8'))
             return
-
+ 
         ensure_schema()
         client = get_turso_client()
         try:
@@ -439,12 +433,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
         finally:
             client.close()
-
+ 
         self.send_response(200)
         self._cors()
         self.end_headers()
         self.wfile.write(b'ok')
-
+ 
     def _handle_corpus_save_precedent(self, body):
         case_id = (body.get('case_id') or '').strip()
         if not case_id:
@@ -453,7 +447,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('case_id가 필요합니다.'.encode('utf-8'))
             return
-
+ 
         ensure_schema()
         client = get_turso_client()
         try:
@@ -468,12 +462,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
         finally:
             client.close()
-
+ 
         self.send_response(200)
         self._cors()
         self.end_headers()
         self.wfile.write(b'ok')
-
+ 
     def _handle_corpus_save_precedents_batch(self, body):
         items = body.get('items') or []
         if not isinstance(items, list) or not items:
@@ -482,7 +476,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('items 배열이 필요합니다.'.encode('utf-8'))
             return
-
+ 
         ensure_schema()
         client = get_turso_client()
         saved = 0
@@ -507,23 +501,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 saved = len(statements)
         finally:
             client.close()
-
+ 
         self.send_response(200)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(json.dumps({'saved': saved}).encode('utf-8'))
-
+ 
     def log_message(self, format, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
-
-
+ 
+ 
 class ThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
-
-
+ 
+ 
 if __name__ == '__main__':
     with ThreadingServer(("0.0.0.0", PORT), ProxyHandler) as httpd:
         print("서버 실행 중: 포트 %d" % PORT)
         httpd.serve_forever()
+ 
