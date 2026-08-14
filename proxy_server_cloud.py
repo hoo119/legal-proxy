@@ -2,30 +2,6 @@
 """
 법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용)
 --------------------------------------------------------------
-로컬 PC 하나에서만 쓰는 proxy_server.py 와 달리, 이 버전은 Render.com 같은
-클라우드 호스팅에 올려서 '공개 URL'을 부여받아 어느 PC/사람이든 접속할 수 있게 합니다.
-
-배포 방법 (Render.com, 무료):
-1) https://github.com 에 가입 후, 새 저장소(Repository)를 만들고
-   이 파일 하나만 업로드합니다. 파일 이름은 반드시 proxy_server_cloud.py 로 둡니다.
-2) https://render.com 에 GitHub 계정으로 가입합니다.
-3) Render 대시보드에서 "New +" -> "Web Service" -> 방금 만든 GitHub 저장소 선택
-4) 설정값:
-     - Runtime: Python 3
-     - Build Command: (비워둠)
-     - Start Command: python proxy_server_cloud.py
-     - Instance Type: Free
-5) "Create Web Service" 클릭 -> 몇 분 후 다음과 비슷한 공개 주소가 생깁니다:
-     https://legal-ai-proxy-xxxx.onrender.com
-6) legal-ai-assistant.html 파일 안에서
-     var PROXY_BASE = 'http://localhost:8000';
-   부분을 위에서 받은 주소로 교체합니다. 예:
-     var PROXY_BASE = 'https://legal-ai-proxy-xxxx.onrender.com';
-7) 이제 HTML 파일을 어느 PC에서 열어도(더블클릭해도 됩니다) 이 클라우드 프록시를 통해
-   법제처 API를 호출할 수 있습니다.
-
-주의: 무료 요금제는 15분간 요청이 없으면 서버가 잠들고, 다음 요청 시 깨어나는 데
-      약 20~50초가 걸릴 수 있습니다. (첫 질문만 느리고 이후엔 빠릅니다)
 """
 
 import http.server
@@ -58,6 +34,8 @@ DB_PATH = os.environ.get('CORPUS_DB_PATH', 'corpus.db')
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute('PRAGMA journal_mode=WAL')   # 쓰기 성능 개선: 매 저장마다 디스크 전체 동기화하지 않도록
+    conn.execute('PRAGMA synchronous=NORMAL')  # WAL 모드와 함께 쓰면 안전하면서도 훨씬 빠름
     conn.execute('''CREATE TABLE IF NOT EXISTS articles (
         id INTEGER PRIMARY KEY,
         law_name TEXT NOT NULL,
@@ -163,6 +141,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == '/corpus_search_precedents':
             self._handle_corpus_search_precedents(parsed)
+            return
+
+        if parsed.path == '/corpus_pending_precedents':
+            self._handle_corpus_pending_precedents(parsed)
+            return
+
+        if parsed.path == '/corpus_count_precedents':
+            self._handle_corpus_count_precedents(parsed)
             return
 
         if parsed.path != '/proxy':
@@ -291,6 +277,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if parsed.path == '/corpus_save_precedent':
             self._handle_corpus_save_precedent(body)
             return
+        if parsed.path == '/corpus_save_precedents_batch':
+            self._handle_corpus_save_precedents_batch(body)
+            return
 
         self.send_response(404)
         self._cors()
@@ -373,6 +362,46 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
 
+    def _handle_corpus_pending_precedents(self, parsed):
+        # 목록만 저장되고(요지가 비어있음) 아직 상세조회가 안 된 판례들을 배치로 돌려준다.
+        # 브라우저 수집기가 이걸 호출해서 "다음에 뭘 상세조회해야 하는지" 서버 DB에서 바로 받아간다
+        # (localStorage 용량 제한 없이, 진행상태를 서버 코퍼스 자체에 두는 방식)
+        qs = urllib.parse.parse_qs(parsed.query)
+        limit = qs.get('limit', ['20'])[0]
+        try:
+            limit_num = max(1, min(int(limit), 100))
+        except ValueError:
+            limit_num = 20
+
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                "SELECT case_id, case_no FROM precedents WHERE summary IS NULL OR summary = '' LIMIT ?",
+                [limit_num]
+            ).fetchall()
+            items = [{'case_id': r[0], 'case_no': r[1]} for r in rows]
+        finally:
+            conn.close()
+
+        self.send_response(200)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
+
+    def _handle_corpus_count_precedents(self, parsed):
+        conn = get_db()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM precedents").fetchone()[0]
+            pending = conn.execute("SELECT COUNT(*) FROM precedents WHERE summary IS NULL OR summary = ''").fetchone()[0]
+        finally:
+            conn.close()
+        self.send_response(200)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({'total': total, 'pending': pending, 'done': total - pending}).encode('utf-8'))
+
     def _handle_corpus_save_article(self, body):
         law = (body.get('law') or '').strip()
         no = (body.get('no') or '').strip()
@@ -428,6 +457,43 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
         self.wfile.write(b'ok')
+
+    def _handle_corpus_save_precedents_batch(self, body):
+        # 여러 건을 한 트랜잭션으로 저장 — 건마다 디스크 동기화하던 방식보다 훨씬 빠르고 타임아웃도 적음
+        items = body.get('items') or []
+        if not isinstance(items, list) or not items:
+            self.send_response(400)
+            self._cors()
+            self.end_headers()
+            self.wfile.write('items 배열이 필요합니다.'.encode('utf-8'))
+            return
+
+        conn = get_db()
+        saved = 0
+        try:
+            for it in items:
+                case_id = (it.get('case_id') or '').strip()
+                if not case_id:
+                    continue
+                conn.execute(
+                    'INSERT INTO precedents (case_id, case_no, case_name, court, date, summary) '
+                    'VALUES (?, ?, ?, ?, ?, ?) '
+                    'ON CONFLICT(case_id) DO UPDATE SET '
+                    'case_no=excluded.case_no, case_name=excluded.case_name, '
+                    'court=excluded.court, date=excluded.date, summary=excluded.summary',
+                    [case_id, it.get('case_no', ''), it.get('case_name', ''),
+                     it.get('court', ''), it.get('date', ''), it.get('summary', '')]
+                )
+                saved += 1
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.send_response(200)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({'saved': saved}).encode('utf-8'))
 
     def log_message(self, format, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
