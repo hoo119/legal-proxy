@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용, Turso 코퍼스 연동판)
@@ -387,16 +386,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         ensure_schema()
         client = get_turso_client()
         try:
-            total = client.execute("SELECT COUNT(*) FROM precedents").rows[0][0]
-            pending = client.execute(
-                "SELECT COUNT(*) FROM precedents WHERE summary IS NULL OR summary = ''"
-            ).rows[0][0]
-            supreme_total = client.execute(
-                "SELECT COUNT(*) FROM precedents WHERE court = '대법원'"
-            ).rows[0][0]
-            supreme_pending = client.execute(
-                "SELECT COUNT(*) FROM precedents WHERE court = '대법원' AND (summary IS NULL OR summary = '')"
-            ).rows[0][0]
+            # 쿼리 4번을 왕복하던 것을 1번으로 합침. Turso 무료 티어에서 짧은 시간에
+            # 여러 번 연속 요청하면 간헐적으로 응답이 깨져 libsql_client 내부에서
+            # KeyError: 'result' 가 나는 경우가 있었는데, 왕복 횟수를 줄여서 방지한다.
+            row = client.execute(
+                "SELECT "
+                "COUNT(*), "
+                "SUM(CASE WHEN summary IS NULL OR summary = '' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN court = '대법원' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN court = '대법원' AND (summary IS NULL OR summary = '') THEN 1 ELSE 0 END) "
+                "FROM precedents"
+            ).rows[0]
+
+            total = row[0] or 0
+            pending = row[1] or 0
+            supreme_total = row[2] or 0
+            supreme_pending = row[3] or 0
             lower_total = total - supreme_total
             lower_pending = pending - supreme_pending
         finally:
@@ -521,4 +526,3 @@ if __name__ == '__main__':
     with ThreadingServer(("0.0.0.0", PORT), ProxyHandler) as httpd:
         print("서버 실행 중: 포트 %d" % PORT)
         httpd.serve_forever()
- 
