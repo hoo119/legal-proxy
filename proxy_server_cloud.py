@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용, Turso 코퍼스 연동판)
@@ -12,6 +13,7 @@ import urllib.parse
 import os
 import sys
 import json
+import time
  
 try:
     import libsql_client
@@ -39,6 +41,12 @@ def get_turso_client():
  
  
 _schema_ready = False
+
+# corpus_count_precedents는 COUNT/SUM 집계라서 인덱스가 있어도 매번 테이블 전체를
+# 훑어야 한다. 클라이언트가 몇 초~몇십 초 간격으로 반복 호출해도 실제 DB 쿼리는
+# CACHE_TTL_SECONDS에 한 번만 나가도록 짧게 캐싱해서 Turso 읽기 할당량 폭증을 막는다.
+_count_cache = {'data': None, 'ts': 0}
+COUNT_CACHE_TTL_SECONDS = 20
  
  
 def ensure_schema():
@@ -78,6 +86,11 @@ def ensure_schema():
                 date TEXT,
                 summary TEXT
             )''',
+            # 부분 인덱스: summary가 비어있는(=상세조회 대상인) 행만 인덱싱한다.
+            # corpus_pending_precedents가 LIMIT과 함께 이 인덱스를 타면, 전체 테이블을
+            # 스캔하지 않고 필요한 건수만 읽어서 Turso 읽기 할당량 소모를 크게 줄인다.
+            '''CREATE INDEX IF NOT EXISTS idx_precedents_pending
+                ON precedents(id) WHERE summary IS NULL OR summary = \'\'''',
             '''CREATE VIRTUAL TABLE IF NOT EXISTS precedents_fts USING fts5(
                 case_no UNINDEXED, case_name, summary, content='precedents', content_rowid='id'
             )''',
@@ -383,39 +396,47 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
  
     def _handle_corpus_count_precedents(self, parsed):
-        ensure_schema()
-        client = get_turso_client()
-        try:
-            # 쿼리 4번을 왕복하던 것을 1번으로 합침. Turso 무료 티어에서 짧은 시간에
-            # 여러 번 연속 요청하면 간헐적으로 응답이 깨져 libsql_client 내부에서
-            # KeyError: 'result' 가 나는 경우가 있었는데, 왕복 횟수를 줄여서 방지한다.
-            row = client.execute(
-                "SELECT "
-                "COUNT(*), "
-                "SUM(CASE WHEN summary IS NULL OR summary = '' THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN court = '대법원' THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN court = '대법원' AND (summary IS NULL OR summary = '') THEN 1 ELSE 0 END) "
-                "FROM precedents"
-            ).rows[0]
+        now = time.time()
+        if _count_cache['data'] is not None and (now - _count_cache['ts']) < COUNT_CACHE_TTL_SECONDS:
+            payload = _count_cache['data']
+        else:
+            ensure_schema()
+            client = get_turso_client()
+            try:
+                # 쿼리 4번을 왕복하던 것을 1번으로 합침. Turso 무료 티어에서 짧은 시간에
+                # 여러 번 연속 요청하면 간헐적으로 응답이 깨져 libsql_client 내부에서
+                # KeyError: 'result' 가 나는 경우가 있었는데, 왕복 횟수를 줄여서 방지한다.
+                row = client.execute(
+                    "SELECT "
+                    "COUNT(*), "
+                    "SUM(CASE WHEN summary IS NULL OR summary = '' THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN court = '대법원' THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN court = '대법원' AND (summary IS NULL OR summary = '') THEN 1 ELSE 0 END) "
+                    "FROM precedents"
+                ).rows[0]
 
-            total = row[0] or 0
-            pending = row[1] or 0
-            supreme_total = row[2] or 0
-            supreme_pending = row[3] or 0
-            lower_total = total - supreme_total
-            lower_pending = pending - supreme_pending
-        finally:
-            client.close()
- 
+                total = row[0] or 0
+                pending = row[1] or 0
+                supreme_total = row[2] or 0
+                supreme_pending = row[3] or 0
+                lower_total = total - supreme_total
+                lower_pending = pending - supreme_pending
+            finally:
+                client.close()
+
+            payload = {
+                'total': total, 'pending': pending, 'done': total - pending,
+                'supreme': {'total': supreme_total, 'pending': supreme_pending, 'done': supreme_total - supreme_pending},
+                'lower': {'total': lower_total, 'pending': lower_pending, 'done': lower_total - lower_pending}
+            }
+            _count_cache['data'] = payload
+            _count_cache['ts'] = now
+
         self.send_response(200)
         self._cors()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
-        self.wfile.write(json.dumps({
-            'total': total, 'pending': pending, 'done': total - pending,
-            'supreme': {'total': supreme_total, 'pending': supreme_pending, 'done': supreme_total - supreme_pending},
-            'lower': {'total': lower_total, 'pending': lower_pending, 'done': lower_total - lower_pending}
-        }).encode('utf-8'))
+        self.wfile.write(json.dumps(payload).encode('utf-8'))
  
     def _handle_corpus_save_article(self, body):
         law = (body.get('law') or '').strip()
@@ -526,3 +547,4 @@ if __name__ == '__main__':
     with ThreadingServer(("0.0.0.0", PORT), ProxyHandler) as httpd:
         print("서버 실행 중: 포트 %d" % PORT)
         httpd.serve_forever()
+ 
