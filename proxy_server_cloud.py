@@ -2,6 +2,7 @@
 """
 법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용, Supabase/PostgreSQL 코퍼스 연동판)
 --------------------------------------------------------------------------------
+
 """
 
 import http.server
@@ -127,16 +128,17 @@ def ensure_schema():
                     ON precedents (court)
                 ''')
                 # 전문 검색용 GIN 인덱스 ('simple' 설정: 형태소 분석 없이 토큰 매칭만 함,
-                # 이전 SQLite FTS5 unicode61 토크나이저와 비슷한 수준의 단순 매칭)
+                # 이전 SQLite FTS5 unicode61 토크나이저와 비슷한 수준의 단순 매칭).
+                #
+                # articles(법조문)는 테이블이 작아서(수백MB 미만) 인덱스를 그대로 둔다.
+                # precedents(판례)는 건수가 훨씬 많아 GIN 인덱스가 원본 데이터만큼의
+                # 저장공간을 추가로 잡아먹어 무료 500MB 한도를 압박하므로, 여기서는
+                # 일부러 만들지 않는다. 인덱스가 없어도 검색 "결과"는 완전히 동일하고,
+                # 다만 매 검색 요청마다 테이블을 훑어야 해서 조금 느려질 뿐이다
+                # (검색이 자주 반복 호출되는 구조가 아니라 감내할 만한 수준).
                 cur.execute('''
                     CREATE INDEX IF NOT EXISTS idx_articles_fts
                     ON articles USING GIN (to_tsvector('simple', law_name || ' ' || content))
-                ''')
-                cur.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_precedents_fts
-                    ON precedents USING GIN (
-                        to_tsvector('simple', coalesce(case_name, '') || ' ' || coalesce(summary, ''))
-                    )
                 ''')
                 conn.commit()
                 _schema_ready = True
