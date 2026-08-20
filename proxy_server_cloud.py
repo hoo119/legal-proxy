@@ -2,30 +2,7 @@
 """
 법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용, Supabase/PostgreSQL 코퍼스 연동판)
 --------------------------------------------------------------------------------
-코퍼스(조문·판례 저장소)는 Turso 대신 Supabase(PostgreSQL, 무료 티어)에 저장합니다.
-Supabase 무료 티어는 Turso처럼 "읽은 행 수"로 과금/차단하지 않아서, 이 앱처럼
-폴링(진행상황 조회 등)이 잦은 구조에서 할당량 초과로 계정이 통째로 잠기는 문제가
-생기지 않습니다.
 
-배포 방법 (Render.com, 무료):
-1) https://supabase.com 에서 새 프로젝트 생성 (무료 플랜)
-2) Supabase 대시보드 > Project Settings > Database > Connection string 에서
-   "URI" 형식 연결 문자열을 복사 (예: postgresql://postgres:[password]@...supabase.co:5432/postgres)
-   * Connection Pooling(Transaction 모드, 6543 포트) 주소를 쓰는 걸 권장합니다.
-3) https://github.com 에 새 저장소를 만들고 이 파일 하나만 업로드 (파일명 그대로 유지)
-4) https://render.com 에서 GitHub 저장소 선택해 Web Service 생성
-5) 설정값:
-     - Runtime: Python 3
-     - Build Command: pip install psycopg2-binary
-     - Start Command: python proxy_server_cloud.py
-     - Instance Type: Free
-6) Render 대시보드 > Environment 탭에서 아래 환경변수 등록:
-     - SUPABASE_DB_URL  (2번에서 복사한 연결 문자열)
-     - GOOGLE_API_KEY, GOOGLE_CX (선택, 웹검색 발견 기능용)
-7) legal-ai-assistant.html / collector.html 의 프록시 주소를 이 서비스의 공개 주소로 맞춰둡니다.
-
-주의: 무료 요금제는 15분간 요청이 없으면 서버가 잠들고, 다음 요청 시 깨어나는 데
-      약 20~50초가 걸릴 수 있습니다.
 """
 
 import http.server
