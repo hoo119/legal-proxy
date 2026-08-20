@@ -2,7 +2,6 @@
 """
 법률 AI 어시스턴트용 클라우드 프록시 서버 (Render.com 배포용, Supabase/PostgreSQL 코퍼스 연동판)
 --------------------------------------------------------------------------------
-
 """
 
 import http.server
@@ -104,6 +103,16 @@ def ensure_schema():
                         court TEXT,
                         date TEXT,
                         summary TEXT
+                    )
+                ''')
+                # 1단계(목록 수집)가 "어느 범위를 몇 페이지까지 했는지"를 브라우저
+                # localStorage가 아니라 서버에 저장해둔다. 이러면 다른 PC에서 같은
+                # collector.html을 열어도 항상 정확한 지점부터 이어서 시작할 수 있다.
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS collection_progress (
+                        scope_key TEXT PRIMARY KEY,
+                        next_page INTEGER NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                     )
                 ''')
                 # 부분 인덱스: summary가 비어있는(=상세조회 대상인) 행만 인덱싱.
@@ -209,6 +218,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._handle_corpus_count_precedents(parsed)
             return
 
+        if parsed.path == '/corpus_count_articles':
+            self._handle_corpus_count_articles(parsed)
+            return
+
+        if parsed.path == '/corpus_get_progress':
+            self._handle_corpus_get_progress(parsed)
+            return
+
         if parsed.path != '/proxy':
             self.send_response(404)
             self._cors()
@@ -285,6 +302,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         if parsed.path == '/corpus_save_precedents_batch':
             self._handle_corpus_save_precedents_batch(body)
+            return
+        if parsed.path == '/corpus_save_articles_batch':
+            self._handle_corpus_save_articles_batch(body)
+            return
+        if parsed.path == '/corpus_set_progress':
+            self._handle_corpus_set_progress(body)
             return
 
         self.send_response(404)
@@ -438,6 +461,63 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps({'items': items}, ensure_ascii=False).encode('utf-8'))
 
+    def _handle_corpus_get_progress(self, parsed):
+        qs = urllib.parse.parse_qs(parsed.query)
+        scope = (qs.get('scope', [None])[0] or '').strip()
+        if not scope:
+            self.send_response(400)
+            self._cors()
+            self.end_headers()
+            self.wfile.write('scope 파라미터가 필요합니다.'.encode('utf-8'))
+            return
+
+        ensure_schema()
+        with PgConn() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT next_page FROM collection_progress WHERE scope_key = %s", [scope])
+                row = cur.fetchone()
+            finally:
+                cur.close()
+
+        next_page = row[0] if row else 1
+        self.send_response(200)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({'next_page': next_page}).encode('utf-8'))
+
+    def _handle_corpus_set_progress(self, body):
+        scope = (body.get('scope') or '').strip()
+        next_page = body.get('next_page')
+        if not scope or not isinstance(next_page, int):
+            self.send_response(400)
+            self._cors()
+            self.end_headers()
+            self.wfile.write('scope, next_page(정수)가 필요합니다.'.encode('utf-8'))
+            return
+
+        ensure_schema()
+        with PgConn() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    'INSERT INTO collection_progress (scope_key, next_page, updated_at) VALUES (%s, %s, now()) '
+                    'ON CONFLICT (scope_key) DO UPDATE SET next_page = EXCLUDED.next_page, updated_at = now()',
+                    [scope, next_page]
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                cur.close()
+
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
+        self.wfile.write(b'ok')
+
     def _handle_corpus_count_precedents(self, parsed):
         now = time.time()
         if _count_cache['data'] is not None and (now - _count_cache['ts']) < COUNT_CACHE_TTL_SECONDS:
@@ -511,6 +591,69 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
         self.wfile.write(b'ok')
+
+    def _handle_corpus_save_articles_batch(self, body):
+        items = body.get('items') or []
+        if not isinstance(items, list) or not items:
+            self.send_response(400)
+            self._cors()
+            self.end_headers()
+            self.wfile.write('items 배열이 필요합니다.'.encode('utf-8'))
+            return
+
+        ensure_schema()
+        rows_to_upsert = []
+        for it in items:
+            law = (it.get('law') or '').strip()
+            no = (it.get('no') or '').strip()
+            content = (it.get('content') or '').strip()
+            if not law or not no or not content:
+                continue
+            rows_to_upsert.append((law, no, content))
+
+        saved = 0
+        if rows_to_upsert:
+            with PgConn() as conn:
+                cur = conn.cursor()
+                try:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        'INSERT INTO articles (law_name, article_no, content) VALUES %s '
+                        'ON CONFLICT (law_name, article_no) DO UPDATE SET content = EXCLUDED.content',
+                        rows_to_upsert
+                    )
+                    conn.commit()
+                    saved = len(rows_to_upsert)
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    cur.close()
+
+        self.send_response(200)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({'saved': saved}).encode('utf-8'))
+
+    def _handle_corpus_count_articles(self, parsed):
+        ensure_schema()
+        with PgConn() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT COUNT(*), COUNT(DISTINCT law_name) FROM articles")
+                row = cur.fetchone()
+            finally:
+                cur.close()
+
+        self.send_response(200)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            'total_articles': row[0] or 0,
+            'total_laws': row[1] or 0
+        }).encode('utf-8'))
 
     def _handle_corpus_save_precedent(self, body):
         case_id = (body.get('case_id') or '').strip()
